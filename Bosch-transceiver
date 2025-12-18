@@ -1,0 +1,1985 @@
+esphome:
+  name: bosch-transceiver
+  friendly_name: Bosch IR transceiver
+  compile_process_limit: 1
+  
+  on_boot:
+    priority: -100
+    then:
+      - delay: 2s
+      - lambda: |-
+          ESP_LOGI("boot", "=== Restoring AC State ===");
+          ESP_LOGI("boot", "Power:%d Mode:%d Temp:%d Fan:%d", 
+                   id(ac_power), id(ac_mode), id(ac_temperature), id(ac_fan_speed));
+      - lambda: |-
+          id(ac_power_switch).publish_state(id(ac_power));
+          id(ac_temp_number).publish_state(id(ac_temperature));
+          id(ac_ion_switch).publish_state(id(ac_ion));
+          id(ac_swing_h_switch).publish_state(id(ac_swing_horizontal));
+          id(ac_swing_v_switch).publish_state(id(ac_swing_vertical));
+          id(ac_progressive_switch).publish_state(id(ac_progressive_airflow));
+          id(ac_max_mode_switch).publish_state(id(ac_max_mode));
+          id(ac_clean_mode_switch).publish_state(id(ac_clean_mode));
+      - lambda: |-
+          const char* mode_text[] = {"Auto", "Heat", "Cool", "Dry"};
+          if (id(ac_mode) >= 0 && id(ac_mode) <= 3) {
+            id(ac_mode_select).publish_state(mode_text[id(ac_mode)]);
+          }
+          
+          const char* fan_text[] = {"Auto", "Low", "Medium", "High"};
+          if (id(ac_fan_speed) >= 0 && id(ac_fan_speed) <= 3) {
+            id(ac_fan_select).publish_state(fan_text[id(ac_fan_speed)]);
+          }
+      - lambda: |-
+          bool h = id(ac_swing_horizontal);
+          bool v = id(ac_swing_vertical);
+          bool p = id(ac_progressive_airflow);
+          
+          if (!h && !v && !p) id(ac_swing_control_select).publish_state("Off");
+          else if (h && !v && !p) id(ac_swing_control_select).publish_state("Horizontal");
+          else if (!h && v && !p) id(ac_swing_control_select).publish_state("Vertical");
+          else if (!h && !v && p) id(ac_swing_control_select).publish_state("Progressive");
+          else if (h && v && !p) id(ac_swing_control_select).publish_state("H + V");
+          else if (h && !v && p) id(ac_swing_control_select).publish_state("H + Progressive");
+      - lambda: |-
+          auto call = id(bosch_ac_climate).make_call();
+          
+          if (!id(ac_power)) {
+            call.set_mode(CLIMATE_MODE_OFF);
+          } else if (id(ac_mode) == 0) {
+            call.set_mode(CLIMATE_MODE_AUTO);
+          } else if (id(ac_mode) == 1) {
+            call.set_mode(CLIMATE_MODE_HEAT);
+            if (id(ac_temperature) >= 18 && id(ac_temperature) <= 32) {
+              call.set_target_temperature_low(id(ac_temperature));
+            }
+          } else if (id(ac_mode) == 2) {
+            call.set_mode(CLIMATE_MODE_COOL);
+            if (id(ac_temperature) >= 18 && id(ac_temperature) <= 32) {
+              call.set_target_temperature_high(id(ac_temperature));
+            }
+          } else if (id(ac_mode) == 3) {
+            call.set_mode(CLIMATE_MODE_DRY);
+          }
+          
+          const char* fan_modes[] = {"auto", "low", "medium", "high"};
+          if (id(ac_fan_speed) >= 0 && id(ac_fan_speed) <= 3) {
+            call.set_fan_mode(fan_modes[id(ac_fan_speed)]);
+          }
+          
+          if (id(ac_swing_horizontal) && id(ac_swing_vertical)) {
+            call.set_swing_mode("both");
+          } else if (id(ac_swing_horizontal)) {
+            call.set_swing_mode("horizontal");
+          } else if (id(ac_swing_vertical)) {
+            call.set_swing_mode("vertical");
+          } else {
+            call.set_swing_mode("off");
+          }
+          
+          call.perform();
+          ESP_LOGI("boot", "State restoration complete");
+
+esp32:
+  board: esp32dev
+  framework:
+    type: arduino
+
+climate:
+  - platform: thermostat
+    name: "Bosch AC"
+    id: bosch_ac_climate
+    sensor: temp_vardagsrum_temperature_bosch
+    on_boot_restore_from: memory
+
+    # Heating configuration
+    heat_action:
+      - lambda: |-
+          if (id(ac_clean_mode)) {
+            ESP_LOGW("climate", "Cannot change - Clean mode active");
+            return;
+          }
+          
+          // Get target temperature from climate entity
+          float target = id(bosch_ac_climate).target_temperature;
+          int new_temp = (int)target;
+          
+          bool was_off = !id(ac_power);
+          if (!was_off) {
+            // Already on, just change mode and temperature
+            id(ac_mode) = 1;
+            id(ac_max_mode) = false;
+            if (new_temp >= 18 && new_temp <= 32) {
+              id(ac_temperature) = new_temp;
+              id(ac_temp_number).publish_state(new_temp);
+            } else if (id(ac_temperature) < 18 || id(ac_temperature) > 32) {
+              id(ac_temperature) = 23;
+              id(ac_temp_number).publish_state(23);
+            }
+            id(send_ac_command).execute();
+            return;
+          }
+          
+          // Power on sequence
+          id(ac_power) = true;
+          id(ac_swing_horizontal) = false;
+          id(ac_swing_vertical) = false;
+          id(prev_swing_h) = false;
+          id(prev_swing_v) = false;
+          id(ac_mode) = 1;
+          id(ac_max_mode) = false;
+          
+          // Set fan speed to Auto
+          id(ac_fan_speed) = 0;
+          id(ac_fan_select).publish_state("Auto");
+          
+          // Set temperature from target or default
+          if (new_temp >= 18 && new_temp <= 32) {
+            id(ac_temperature) = new_temp;
+            id(ac_temp_number).publish_state(new_temp);
+          } else {
+            id(ac_temperature) = 23;
+            id(ac_temp_number).publish_state(23);
+          }
+          
+          id(send_ac_command).execute();
+
+          // Update climate entity fan mode
+          auto call = id(bosch_ac_climate).make_call();
+          call.set_fan_mode("auto");
+          call.perform();
+
+          // Turn on swings after power on
+          delay(800);
+          id(ac_swing_horizontal) = true;
+          id(ac_swing_h_switch).publish_state(true);
+          id(send_ac_command).execute();
+          delay(800);
+          id(ac_swing_vertical) = true;
+          id(ac_swing_v_switch).publish_state(true);
+          id(send_ac_command).execute();
+    
+    # Cooling configuration
+    cool_action:
+      - lambda: |-
+          if (id(ac_clean_mode)) {
+            ESP_LOGW("climate", "Cannot change - Clean mode active");
+            return;
+          }
+          
+          // Get target temperature from climate entity
+          float target = id(bosch_ac_climate).target_temperature;
+          int new_temp = (int)target;
+          
+          bool was_off = !id(ac_power);
+          if (!was_off) {
+            // Already on, just change mode and temperature
+            id(ac_mode) = 2;
+            id(ac_max_mode) = false;
+            if (new_temp >= 18 && new_temp <= 32) {
+              id(ac_temperature) = new_temp;
+              id(ac_temp_number).publish_state(new_temp);
+            } else if (id(ac_temperature) < 18 || id(ac_temperature) > 32) {
+              id(ac_temperature) = 26;
+              id(ac_temp_number).publish_state(26);
+            }
+            id(send_ac_command).execute();
+            return;
+          }
+          
+          // Power on sequence
+          id(ac_power) = true;
+          id(ac_swing_horizontal) = false;
+          id(ac_swing_vertical) = false;
+          id(prev_swing_h) = false;
+          id(prev_swing_v) = false;
+          id(ac_mode) = 2;
+          id(ac_max_mode) = false;
+          
+          // Set fan speed to Auto
+          id(ac_fan_speed) = 0;
+          id(ac_fan_select).publish_state("Auto");
+          
+          // Set temperature from target or default
+          if (new_temp >= 18 && new_temp <= 32) {
+            id(ac_temperature) = new_temp;
+            id(ac_temp_number).publish_state(new_temp);
+          } else {
+            id(ac_temperature) = 26;
+            id(ac_temp_number).publish_state(26);
+          }
+          
+          id(send_ac_command).execute();
+          
+          // Update climate entity fan mode
+          auto call = id(bosch_ac_climate).make_call();
+          call.set_fan_mode("auto");
+          call.perform();          
+          
+          // Turn on swings after power on
+          delay(800);
+          id(ac_swing_horizontal) = true;
+          id(ac_swing_h_switch).publish_state(true);
+          id(send_ac_command).execute();
+          delay(800);
+          id(ac_swing_vertical) = true;
+          id(ac_swing_v_switch).publish_state(true);
+          id(send_ac_command).execute();
+    
+    # Dry/Dehumidify mode
+    dry_action:
+      - lambda: |-
+          if (id(ac_clean_mode)) {
+            ESP_LOGW("climate", "Cannot change - Clean mode active");
+            return;
+          }
+          bool was_off = !id(ac_power);
+          if (!was_off) {
+            // Already on, just change mode
+            id(ac_mode) = 3;
+            id(ac_temperature) = 0;
+            id(ac_fan_speed) = 0;
+            id(ac_max_mode) = false;
+            id(send_ac_command).execute();
+            return;
+          }
+          
+          // Power on sequence
+          id(ac_power) = true;
+          id(ac_swing_horizontal) = false;
+          id(ac_swing_vertical) = false;
+          id(prev_swing_h) = false;
+          id(prev_swing_v) = false;
+          id(ac_mode) = 3;
+          id(ac_temperature) = 0;
+          id(ac_fan_speed) = 0;
+          id(ac_max_mode) = false;
+          
+          // Ensure fan is Auto (required for dry mode)
+          id(ac_fan_select).publish_state("Auto");
+          
+          id(send_ac_command).execute();
+          
+          // Turn on swings after power on
+          delay(800);
+          id(ac_swing_horizontal) = true;
+          id(ac_swing_h_switch).publish_state(true);
+          id(send_ac_command).execute();
+          delay(800);
+          id(ac_swing_vertical) = true;
+          id(ac_swing_v_switch).publish_state(true);
+          id(send_ac_command).execute();
+    
+    # Fan only mode
+    fan_only_action:
+      - lambda: |-
+          if (id(ac_clean_mode)) {
+            ESP_LOGW("climate", "Cannot change - Clean mode active");
+            return;
+          }
+          bool was_off = !id(ac_power);
+          if (!was_off) {
+            // Already on, just change to fan mode (heat at 18°C)
+            id(ac_mode) = 1;
+            id(ac_temperature) = 18;
+            id(ac_fan_speed) = 0;
+            id(ac_max_mode) = false;
+            id(send_ac_command).execute();
+            return;
+          }
+          
+          // Power on sequence
+          id(ac_power) = true;
+          id(ac_swing_horizontal) = false;
+          id(ac_swing_vertical) = false;
+          id(prev_swing_h) = false;
+          id(prev_swing_v) = false;
+          id(ac_mode) = 1;
+          id(ac_temperature) = 18;
+          id(ac_fan_speed) = 0;
+          id(ac_max_mode) = false;
+          
+          // Set fan to Auto and update UI
+          id(ac_fan_select).publish_state("Auto");
+          
+          id(send_ac_command).execute();
+          
+          // Turn on swings after power on
+          delay(800);
+          id(ac_swing_horizontal) = true;
+          id(ac_swing_h_switch).publish_state(true);
+          id(send_ac_command).execute();
+          delay(800);
+          id(ac_swing_vertical) = true;
+          id(ac_swing_v_switch).publish_state(true);
+          id(send_ac_command).execute();
+    
+    # Idle/Off action
+    idle_action:
+      - lambda: |-
+          ESP_LOGW("climate", "Idle action - bosch");
+    
+    # Fan mode configuration
+    fan_mode_auto_action:
+      - lambda: |-
+          if (id(ac_clean_mode)) return;
+          id(ac_fan_speed) = 0;
+          id(send_ac_command).execute();
+    
+    fan_mode_low_action:
+      - lambda: |-
+          if (id(ac_clean_mode)) return;
+          if (id(ac_mode) == 3) {
+            ESP_LOGW("climate", "Dry mode only supports Auto fan");
+            return;
+          }
+          id(ac_fan_speed) = 1;
+          id(send_ac_command).execute();
+    
+    fan_mode_medium_action:
+      - lambda: |-
+          if (id(ac_clean_mode)) return;
+          if (id(ac_mode) == 3) {
+            ESP_LOGW("climate", "Dry mode only supports Auto fan");
+            return;
+          }
+          id(ac_fan_speed) = 2;
+          id(send_ac_command).execute();
+    
+    fan_mode_high_action:
+      - lambda: |-
+          if (id(ac_clean_mode)) return;
+          if (id(ac_mode) == 3) {
+            ESP_LOGW("climate", "Dry mode only supports Auto fan");
+            return;
+          }
+          id(ac_fan_speed) = 3;
+          id(send_ac_command).execute();
+    
+    # Swing mode configuration - simplified to just control the swings
+    swing_off_action:
+      - lambda: |-
+          if (id(ac_clean_mode)) return;
+          bool changed = false;
+          if (id(ac_swing_vertical)) {
+            id(ac_swing_vertical) = false;
+            id(ac_swing_v_switch).publish_state(false);
+            id(send_ac_command).execute();
+            changed = true;
+            delay(800);
+          }
+          if (id(ac_swing_horizontal)) {
+            id(ac_swing_horizontal) = false;
+            id(ac_swing_h_switch).publish_state(false);
+            id(send_ac_command).execute();
+          }
+          id(ac_progressive_airflow) = false;
+          id(ac_progressive_switch).publish_state(false);
+    
+    swing_horizontal_action:
+      - lambda: |-
+          if (id(ac_clean_mode)) return;
+          id(ac_progressive_airflow) = false;
+          id(ac_progressive_switch).publish_state(false);
+          bool changed = false;
+          if (id(ac_swing_vertical)) {
+            id(ac_swing_vertical) = false;
+            id(ac_swing_v_switch).publish_state(false);
+            id(send_ac_command).execute();
+            changed = true;
+            delay(800);
+          }
+          if (!id(ac_swing_horizontal)) {
+            id(ac_swing_horizontal) = true;
+            id(ac_swing_h_switch).publish_state(true);
+            id(send_ac_command).execute();
+          }
+    
+    swing_vertical_action:
+      - lambda: |-
+          if (id(ac_clean_mode)) return;
+          id(ac_progressive_airflow) = false;
+          id(ac_progressive_switch).publish_state(false);
+          bool changed = false;
+          if (id(ac_swing_horizontal)) {
+            id(ac_swing_horizontal) = false;
+            id(ac_swing_h_switch).publish_state(false);
+            id(send_ac_command).execute();
+            changed = true;
+            delay(800);
+          }
+          if (!id(ac_swing_vertical)) {
+            id(ac_swing_vertical) = true;
+            id(ac_swing_v_switch).publish_state(true);
+            id(send_ac_command).execute();
+          }
+    
+    swing_both_action:
+      - lambda: |-
+          if (id(ac_clean_mode)) return;
+          id(ac_progressive_airflow) = false;
+          id(ac_progressive_switch).publish_state(false);
+          bool v_changed = false;
+          if (!id(ac_swing_vertical)) {
+            id(ac_swing_vertical) = true;
+            id(ac_swing_v_switch).publish_state(true);
+            id(send_ac_command).execute();
+            v_changed = true;
+          }
+          if (v_changed) delay(800);
+          if (!id(ac_swing_horizontal)) {
+            id(ac_swing_horizontal) = true;
+            id(ac_swing_h_switch).publish_state(true);
+            id(send_ac_command).execute();
+          }
+    
+    # Minimum run times (set to 0 for immediate response)
+    min_cooling_run_time: 0s
+    min_heating_run_time: 0s
+    min_idle_time: 0s
+    min_cooling_off_time: 0s
+    min_heating_off_time: 0s
+    min_fan_mode_switching_time: 0s
+    min_fanning_off_time: 0s
+    min_fanning_run_time: 0s
+    
+    # Visual settings for UI - use ac_temperature as single point of control
+    visual:
+      min_temperature: 18 °C
+      max_temperature: 32 °C
+      temperature_step: 1.0 °C
+    
+    # Set target temperature based on ac_temperature global
+    target_temperature_change_action:
+      - lambda: |-
+          if (id(ac_clean_mode)) {
+            ESP_LOGW("climate", "Cannot change temperature - Clean mode active");
+            return;
+          }
+          
+          int new_temp = 0;
+          
+          // For heat mode (1), use target_temperature_low
+          if (id(ac_mode) == 1) {
+            new_temp = (int)id(bosch_ac_climate).target_temperature_low;
+          } 
+          // For cool mode (2), use target_temperature_high
+          else if (id(ac_mode) == 2) {
+            new_temp = (int)id(bosch_ac_climate).target_temperature_high;
+          }
+          else {
+            // For other modes, don't change temperature
+            return;
+          }
+          
+          if (new_temp >= 18 && new_temp <= 32) {
+            id(ac_temperature) = new_temp;
+            id(ac_temp_number).publish_state(new_temp);
+            id(ac_max_mode) = false;
+            id(send_ac_command).execute();
+            ESP_LOGD("climate", "Temperature set to: %d°C (mode: %d)", new_temp, id(ac_mode));
+          }
+    
+    # Default preset with temperature range
+    preset:
+      - name: Home
+        default_target_temperature_low: 18 °C
+        default_target_temperature_high: 25 °C
+
+logger:
+  level: INFO
+  baud_rate: 115200
+
+api:
+  encryption:
+    key: "your_key"
+  reboot_timeout: 15min
+
+ota:
+  - platform: esphome
+    password: "your_password"
+
+web_server:
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  power_save_mode: none
+  fast_connect: true
+  reboot_timeout: 15min
+
+  ap:
+    ssid: "IR-Transceiver Fallback"
+    password: "your_password"
+
+captive_portal:
+
+# IR Transmitter setup
+remote_transmitter:
+  id: ir_transmitter
+  pin: GPIO4
+  carrier_duty_percent: 50%
+
+# IR Receiver setup
+remote_receiver:
+  pin: 
+    number: GPIO14
+    inverted: true
+    mode:
+      input: true
+      pullup: true
+  dump: raw
+  tolerance: 30%
+  idle: 10ms
+  buffer_size: 2kb
+  on_raw:
+    then:
+      - lambda: |-
+          // Ignore signals shortly after we transmitted (prevent echo)
+          if (millis() - id(last_transmit_time) < 2000) {
+            ESP_LOGD("ir", "Ignoring self-transmitted signal");
+            return;
+          }
+          
+          ESP_LOGI("ir", "=== Sharp IR Signal Received (%d pulses) ===", x.size());
+          
+          // Sharp protocol: skip first 2 pulses (header), then decode mark/space pairs
+          std::vector<uint8_t> decoded_bytes;
+          uint8_t current_byte = 0;
+          int bit_count = 0;
+          
+          // Start from index 2 (skip header pulses)
+          for (size_t i = 2; i < x.size() - 1; i += 2) {
+            int32_t mark = abs(x[i]);
+            int32_t space = abs(x[i + 1]);
+            
+            // Sharp protocol decoding: ~470µs space = 0, ~1420µs space = 1
+            // Using 900µs as threshold (midpoint between 470 and 1420)
+            bool bit_value = (space > 900) ? 1 : 0;
+            
+            // Build byte LSB first (Sharp sends LSB first)
+            current_byte |= (bit_value << bit_count);
+            bit_count++;
+            
+            if (bit_count == 8) {
+              decoded_bytes.push_back(current_byte);
+              current_byte = 0;
+              bit_count = 0;
+            }
+            
+            if (decoded_bytes.size() >= 20) break;
+          }
+          
+          // Format as hex string
+          std::string hex_data = "";
+          for (size_t i = 0; i < decoded_bytes.size() && i < 13; i++) {
+            char buf[8];
+            sprintf(buf, "0x%02X", decoded_bytes[i]);
+            hex_data += buf;
+            if (i < decoded_bytes.size() - 1) hex_data += " ";
+          }
+          
+          ESP_LOGI("ir", "Decoded: %s", hex_data.c_str());
+          id(ir_received_bytes).publish_state(hex_data.c_str());
+
+          // Check for special clean mode signals
+          if (decoded_bytes.size() >= 13) {
+            // Signal 1: Clean mode ON (when power is OFF)
+            if (decoded_bytes[6] == 0x2B) {
+              
+              if (!id(ac_power)) {
+                ESP_LOGI("ir", "Clean mode signal received - Turning ON clean mode");
+                id(ac_clean_mode) = true;
+                id(ac_clean_mode_switch).publish_state(true);
+              } else {
+                ESP_LOGI("ir", "Clean mode signal received but power is ON - Ignoring");
+              }
+              // Skip normal processing
+              id(signal_counter) += 1;
+              id(ir_signal_count).publish_state(id(signal_counter));
+              return;
+              }
+            }
+            
+            // Signal 2: Clean mode OFF (when clean mode is ON)
+            if (decoded_bytes[0] == 0xAA && decoded_bytes[1] == 0x5A && 
+                decoded_bytes[2] == 0xCF && decoded_bytes[3] == 0x10 &&
+                decoded_bytes[5] == 0x21) {
+                
+              if (id(ac_clean_mode)) {
+                ESP_LOGI("ir", "Clean mode OFF signal received - Turning OFF clean mode");
+                id(ac_clean_mode) = false;
+                id(ac_clean_mode_switch).publish_state(false);
+                // Skip normal processing
+                id(signal_counter) += 1;
+                id(ir_signal_count).publish_state(id(signal_counter));
+                return;
+            }
+          }
+
+          // Decode Sharp AC protocol
+          if (decoded_bytes.size() >= 13 && decoded_bytes[0] == 0xAA && decoded_bytes[1] == 0x5A) {
+            
+            // Byte 4: Temperature
+            uint8_t temp_byte = decoded_bytes[4];
+            int temperature = 0;
+            std::string temp_display = "";
+            
+            // Check for Max Mode first (takes priority)
+            if (decoded_bytes[5] == 0x61 && decoded_bytes[7] == 0x00 &&
+                decoded_bytes[10] == 0x01) {
+              id(ac_max_mode) = true;
+              id(prev_max) = true;
+            } else if (decoded_bytes[5] == 0x71 && decoded_bytes[7] == 0x00 &&
+                decoded_bytes[10] == 0x01) {
+              id(ac_max_mode) = false;
+              id(prev_max) = false;
+            } else if (temp_byte >= 0x01 && temp_byte <= 0x0F) {
+              // Normal temperature range: 18-32°C
+              temperature = 17 + temp_byte;
+              id(ac_max_mode) = false;
+              id(prev_max) = false;
+            } else if (temp_byte == 0x00) {
+              // Could be Auto/Dry mode, 10 degree mode, or fan mode
+              // Check byte 5 and 6 for context
+              if (decoded_bytes[5] == 0x31 || decoded_bytes[5] == 0x11) {
+                uint8_t mode_part = decoded_bytes[6] & 0x0F;
+                if (mode_part == 0x01) {
+                  // Heat mode with temp 0x00 could be 10 degree mode
+                  // Need to check swing state from byte 8
+                  uint8_t byte8 = decoded_bytes[8];
+                  if (byte8 == 0x08) {
+                    // Standard command, likely 10 degree or fan setting
+                    temperature = 10;
+                    temp_display = "10";
+                  }
+                } else {
+                  // Auto (0x00) or Dry (0x03) mode
+                  temperature = 0; // Special value for auto temp
+                  temp_display = "Auto";
+                }
+              } else {
+                temperature = 0;
+                temp_display = "Auto";
+              }
+              id(ac_max_mode) = false;
+              id(prev_max) = false;
+            } else {
+              // Could be Auto/Dry mode
+              // Check byte 5 and 6 for context
+              if (decoded_bytes[5] == 0x31 || decoded_bytes[5] == 0x11) {
+                uint8_t mode_part = decoded_bytes[6] & 0x0F;
+                if (mode_part == 0x00 || mode_part == 0x03) {
+                  if (decoded_bytes[4] == 0x00 ) {
+                    // Auto
+                    temperature = 0;
+                    temp_display = "Auto";
+                  } else if (decoded_bytes[4] == 0x90) {
+                    temperature = -1;
+                    temp_display = "Auto -1";
+                  } else if (decoded_bytes[4] == 0xA0) {
+                    temperature = -2;
+                    temp_display = "Auto -2";
+                  } else if (decoded_bytes[4] == 0x10) {
+                    temperature = 1;
+                    temp_display = "Auto +1";
+                  } else if (decoded_bytes[4] == 0x20) {
+                    temperature = +2;
+                    temp_display = "Auto +2";
+                  }
+                }
+              } else {
+                temperature = 0;
+                temp_display = "Error";
+              }
+              id(ac_max_mode) = false;
+              id(prev_max) = false;
+            }
+            
+            // Update global temperature if valid
+            if (temperature >= -2 && temperature <= 32) {
+              id(ac_temperature) = temperature;
+            }
+            
+            // Byte 5: Power mode state
+            uint8_t power_mode_byte = decoded_bytes[5];
+            bool power_on = (power_mode_byte == 0x11 || power_mode_byte == 0x31 || 
+                           power_mode_byte == 0x61 || power_mode_byte == 0x71);
+            id(ac_power) = power_on;
+            
+            // Reset swings when turning ON or OFF (0x11 or 0x21)
+            if (power_mode_byte == 0x11 || power_mode_byte == 0x21) {
+              id(ac_swing_horizontal) = false;
+              id(ac_swing_vertical) = false;
+              id(ac_progressive_airflow) = false;
+              id(prev_swing_h) = false;
+              id(prev_swing_v) = false;
+              ESP_LOGI("ir", "Power %s - Reset all swings to OFF", power_on ? "ON" : "OFF");
+            }
+            
+            // Byte 6: Mode and Fan combined
+            uint8_t mode_fan_byte = decoded_bytes[6];
+            
+            // Extract fan speed (upper nibble)
+            uint8_t fan_part = mode_fan_byte & 0xF0;
+            if (fan_part == 0x20) id(ac_fan_speed) = 0;      // Auto
+            else if (fan_part == 0x30) id(ac_fan_speed) = 1; // Low
+            else if (fan_part == 0x50) id(ac_fan_speed) = 2; // Medium
+            else if (fan_part == 0x70) id(ac_fan_speed) = 3; // High
+            
+            // Extract mode (lower nibble)
+            uint8_t mode_part = mode_fan_byte & 0x0F;
+            if (mode_part == 0x00) id(ac_mode) = 0;      // Auto
+            else if (mode_part == 0x01) id(ac_mode) = 1; // Heat
+            else if (mode_part == 0x02) id(ac_mode) = 2; // Cool
+            else if (mode_part == 0x03) id(ac_mode) = 3; // Dry
+            else if (mode_part == 0x0B) id(ac_mode) = 11; // Clean mode on
+            
+            // Byte 8: Swing toggles and Progressive airflow
+            uint8_t byte8 = decoded_bytes[8];
+            
+            // Progressive airflow toggle
+            if (byte8 == 0x0E) {
+              id(ac_progressive_airflow) = true;
+              id(ac_swing_vertical) = false;
+              id(prev_progressive) = true;
+              ESP_LOGI("ir", "Progressive Airflow: ON");
+            } else if (byte8 == 0x0D) {
+              id(ac_progressive_airflow) = false;
+              id(prev_progressive) = false;
+              ESP_LOGI("ir", "Progressive Airflow: OFF");
+            }
+            
+            // Vertical swing toggle
+            if (byte8 == 0x0F) {
+              id(ac_swing_vertical) = !id(ac_swing_vertical);
+              id(ac_progressive_airflow) = false;
+              id(prev_swing_v) = id(ac_swing_vertical);
+              id(prev_progressive) = false;
+              ESP_LOGI("ir", "Toggle Swing V: %s", id(ac_swing_vertical) ? "ON" : "OFF");
+            }
+            
+            // Horizontal swing toggle
+            if (byte8 == 0xF8) {
+              id(ac_swing_horizontal) = !id(ac_swing_horizontal);
+              id(prev_swing_h) = id(ac_swing_horizontal);
+              ESP_LOGI("ir", "Toggle Swing H: %s", id(ac_swing_horizontal) ? "ON" : "OFF");
+            }
+            
+            // Byte 11: Ion detection
+            uint8_t byte11 = decoded_bytes[11];
+            bool ion_on = (byte11 == 0xF4);
+            id(ac_ion) = ion_on;
+            id(prev_ion) = ion_on;
+            
+            // Update all UI components to reflect received state
+            id(ac_power_switch).publish_state(id(ac_power));
+            id(ac_temp_number).publish_state(id(ac_temperature));
+            id(ac_ion_switch).publish_state(id(ac_ion));
+            id(ac_swing_h_switch).publish_state(id(ac_swing_horizontal));
+            id(ac_swing_v_switch).publish_state(id(ac_swing_vertical));
+            id(ac_progressive_switch).publish_state(id(ac_progressive_airflow));
+            id(ac_max_mode_switch).publish_state(id(ac_max_mode));
+            
+            // Update mode select
+            const char* mode_text = "Heat";
+            if (id(ac_mode) == 0) mode_text = "Auto";
+            else if (id(ac_mode) == 1) mode_text = "Heat";
+            else if (id(ac_mode) == 2) mode_text = "Cool";
+            else if (id(ac_mode) == 3) mode_text = "Dry";
+            id(ac_mode_select).publish_state(mode_text);
+            
+            // Update fan select
+            const char* fan_text = "Auto";
+            if (id(ac_fan_speed) == 0) fan_text = "Auto";
+            else if (id(ac_fan_speed) == 1) fan_text = "Low";
+            else if (id(ac_fan_speed) == 2) fan_text = "Medium";
+            else if (id(ac_fan_speed) == 3) fan_text = "High";
+            id(ac_fan_select).publish_state(fan_text);
+            if (!id(ac_swing_horizontal) && !id(ac_swing_vertical) && !id(ac_progressive_airflow)) {
+              id(ac_swing_control_select).publish_state("Off");
+            } else if (id(ac_swing_horizontal) && !id(ac_swing_vertical) && !id(ac_progressive_airflow)) {
+              id(ac_swing_control_select).publish_state("Horizontal");
+            } else if (!id(ac_swing_horizontal) && id(ac_swing_vertical) && !id(ac_progressive_airflow)) {
+              id(ac_swing_control_select).publish_state("Vertical");
+            } else if (!id(ac_swing_horizontal) && !id(ac_swing_vertical) && id(ac_progressive_airflow)) {
+              id(ac_swing_control_select).publish_state("Progressive");
+            } else if (id(ac_swing_horizontal) && id(ac_swing_vertical) && !id(ac_progressive_airflow)) {
+              id(ac_swing_control_select).publish_state("H + V");
+            } else if (id(ac_swing_horizontal) && !id(ac_swing_vertical) && id(ac_progressive_airflow)) {
+              id(ac_swing_control_select).publish_state("H + Progressive");
+            }
+
+            // Log decoded states
+            ESP_LOGI("ir", "Power: %s, Mode: %s, Temp: %d°C, Fan: %s", 
+                     power_on ? "ON" : "OFF", mode_text, id(ac_temperature), fan_text);
+            ESP_LOGI("ir", "Ion: %s, Max: %s, Progressive: %s",
+                     ion_on ? "ON" : "OFF", id(ac_max_mode) ? "ON" : "OFF",
+                     id(ac_progressive_airflow) ? "ON" : "OFF");
+            ESP_LOGI("ir", "Swing H: %s, Swing V: %s",
+                     id(ac_swing_horizontal) ? "ON" : "OFF", 
+                     id(ac_swing_vertical) ? "ON" : "OFF");
+          }
+          
+          // Update counter
+          id(signal_counter) += 1;
+          id(ir_signal_count).publish_state(id(signal_counter));
+
+globals:
+  # AC State Variables
+  - id: ac_power
+    type: bool
+    restore_value: yes
+    initial_value: 'false'
+  
+  - id: ac_mode
+    type: int
+    restore_value: yes
+    initial_value: '1'
+  
+  - id: ac_temperature
+    type: int
+    restore_value: yes
+    initial_value: '20'
+  
+  - id: ac_fan_speed
+    type: int
+    restore_value: yes
+    initial_value: '0'
+  
+  - id: ac_ion
+    type: bool
+    restore_value: yes
+    initial_value: 'false'
+
+  - id: ac_swing_horizontal
+    type: bool
+    restore_value: yes
+    initial_value: 'false'
+  
+  - id: ac_swing_vertical
+    type: bool
+    restore_value: yes
+    initial_value: 'false'
+  
+  - id: ac_progressive_airflow
+    type: bool
+    restore_value: yes
+    initial_value: 'false'
+  
+  - id: ac_max_mode
+    type: bool
+    restore_value: yes
+    initial_value: 'false'
+
+  - id: ac_clean_mode
+    type: bool
+    restore_value: yes
+    initial_value: 'false'
+
+  - id: byte7_counter
+    type: int
+    restore_value: yes
+    initial_value: '0'
+  
+  - id: prev_ion
+    type: bool
+    restore_value: yes
+    initial_value: 'false'
+
+  - id: prev_max
+    type: bool
+    restore_value: yes
+    initial_value: 'false'
+  
+  - id: prev_progressive
+    type: bool
+    restore_value: yes
+    initial_value: 'false'
+  
+  - id: prev_swing_h
+    type: bool
+    restore_value: yes
+    initial_value: 'false'
+  
+  - id: prev_swing_v
+    type: bool
+    restore_value: yes
+    initial_value: 'false'
+  
+  - id: signal_counter
+    type: int
+    restore_value: no
+    initial_value: '0'
+  
+  - id: last_transmit_time
+    type: unsigned long
+    restore_value: no
+    initial_value: '0'
+
+script:
+  - id: send_ac_command
+    then:
+      - lambda: |-
+          // Record transmission time to ignore echo
+          id(last_transmit_time) = millis();
+          
+          // Fixed header bytes
+          uint8_t data[13];
+          data[0] = 0xAA;
+          data[1] = 0x5A;
+          data[2] = 0xCF;
+          data[3] = 0x10;
+          
+          // Byte 4 - Temperature
+          if (id(ac_max_mode)) {
+            if (id(ac_mode) == 2) {
+              data[4] = 0x05;
+            } else {
+              data[4] = 0x06;
+            }
+          } else if (id(ac_temperature) >= 18 && id(ac_temperature) <= 32) {
+            data[4] = id(ac_temperature) - 17;
+          } else if (id(ac_temperature) == -2) {
+            data[4] = 0xA0;
+          } else if (id(ac_temperature) == -1) {
+            data[4] = 0x90;
+          } else if (id(ac_temperature) == 0) {
+            data[4] = 0x00;
+          } else if (id(ac_temperature) == 1) {
+            data[4] = 0x10;
+          } else if (id(ac_temperature) == 2) {
+            data[4] = 0x20;
+          } else if (id(ac_temperature) == 10) {
+            data[4] = 0x00;
+          } else {
+            data[4] = 0x00;
+          }
+          
+          // Byte 5 - Power Mode State Machine
+          bool ion_changing = (id(ac_ion) != id(prev_ion));
+          bool max_changing = (id(ac_max_mode) != id(prev_max));
+          bool prog_changing = (id(ac_progressive_airflow) != id(prev_progressive));
+          static bool was_powered = false;
+          
+          if (!id(ac_power)) {
+            data[5] = 0x21;
+            was_powered = false;
+          } else {
+            if (!was_powered) {
+              data[5] = 0x11;
+              was_powered = true;
+              id(prev_swing_h) = false;
+              id(prev_swing_v) = false;
+            } else if (ion_changing && id(ac_ion)) {
+              data[5] = 0x61;
+            } else if (ion_changing && !id(ac_ion)) {
+              data[5] = 0x71;
+            } else if (max_changing && id(ac_max_mode)) {
+              data[5] = 0x61;
+            } else if (max_changing && !id(ac_max_mode)) {
+              data[5] = 0x71;
+            } else {
+              data[5] = 0x31;
+            }
+          }
+                 
+          // Byte 6 - Fan speed + Mode combined
+          uint8_t fan_base = 0x20;
+          if (id(ac_fan_speed) == 1) fan_base = 0x30;
+          else if (id(ac_fan_speed) == 2) fan_base = 0x50;
+          else if (id(ac_fan_speed) == 3) fan_base = 0x70;
+          
+          uint8_t mode_value = id(ac_mode);
+          if (mode_value < 0 || mode_value > 3) mode_value = 0;
+          
+          if (id(ac_mode) == 11) {
+            data[6] = 0x2B;
+          } else {
+            data[6] = fan_base | mode_value;
+          }
+          
+          // Byte 7 - Temperature-dependent sequence byte
+          bool swing_h_changed = (id(ac_swing_horizontal) != id(prev_swing_h));
+          bool swing_v_changed = (id(ac_swing_vertical) != id(prev_swing_v));
+
+          if (id(ac_max_mode)) {
+            if (data[5] == 0x61 && id(ac_ion)) {
+              data[7] = 0x08;
+            } else if (data[5] == 0x71 && !id(ac_ion)) {
+              data[7] = 0x08;
+            } else if (swing_v_changed || swing_h_changed) {
+              data[7] = 0x13;
+            } else {
+              data[7] = 0x00;
+            }
+          } else if (data[5] == 0x61) {
+            data[7] = 0x08;
+          } else if (data[5] == 0x71 && (id(prev_ion) != id(ac_ion))) {
+            data[7] = 0x08;
+          } else if (data[5] == 0x71 && (id(prev_max) != id(ac_max_mode))) {
+            data[7] = 0x00;
+          } else if (id(ac_temperature) == 23) {
+            data[7] = 0x14;
+          } else if (id(ac_temperature) == 22) {
+            data[7] = 0x13;
+          } else {
+            uint8_t sequences[] = {0x16, 0x17, 0x18};
+            data[7] = sequences[id(byte7_counter) % 3];
+            id(byte7_counter) = (id(byte7_counter) + 1) % 3;
+          }
+          
+          id(prev_ion) = id(ac_ion);
+          id(prev_max) = id(ac_max_mode);
+          id(prev_progressive) = id(ac_progressive_airflow);
+
+          // Byte 8 - Swing control
+          if (prog_changing) {
+            if (id(ac_progressive_airflow)) {
+              data[8] = 0x0E;
+            } else {
+              data[8] = 0x0D;
+            }
+          } else if (swing_v_changed) {
+            data[8] = 0x0F;
+          } else if (swing_h_changed) {
+            data[8] = 0xF8;
+          } else {
+            data[8] = 0x08;
+          }
+          
+          id(prev_swing_h) = id(ac_swing_horizontal);
+          id(prev_swing_v) = id(ac_swing_vertical);
+          
+          data[9] = 0x80;
+          
+          // Byte 10 - Command type bitmask
+          if (!id(ac_power)) {
+            data[10] = 0x00;
+          } else if (data[5] == 0x11 || data[5] == 0x21) {
+            data[10] = 0x00;
+          } else if (id(ac_max_mode) && data[7] == 0x00) {
+            data[10] = 0x01;
+          } else if (data[5] == 0x71 && data[7] == 0x00) {
+            data[10] = 0x01;
+          } else if (data[8] == 0xF8) {
+            data[10] = 0x07;
+          } else if (data[8] != 0x08) {
+            data[10] = 0x06;
+          } else if (id(ac_fan_speed) != 0) {
+            data[10] = 0x05;
+          } else if (ion_changing) {
+            data[10] = data[8] == 0x08 ? 0x00 : 0x06;
+          } else {
+            data[10] = 0x04;
+          }
+          
+          data[11] = id(ac_ion) ? 0xF4 : 0xF0;
+          data[12] = 0x01;
+          
+          // Calculate checksum
+          uint8_t checksum = 0;
+          for (int i = 0; i < 12; i++) {
+            checksum ^= data[i];
+          }
+          checksum ^= (data[12] & 0x0F);
+          checksum ^= (checksum >> 4);
+          checksum &= 0x0F;
+          data[12] |= (checksum << 4);
+          
+          // Log the complete message
+          ESP_LOGD("sharp_ac", "=== Sending IR Command ===");
+          ESP_LOGD("sharp_ac", "Power: %s", id(ac_power) ? "ON" : "OFF");
+          ESP_LOGD("sharp_ac", "Mode: %d (0=auto,1=heat,2=cool,3=dry)", id(ac_mode));
+          ESP_LOGD("sharp_ac", "Temp: %d°C%s", id(ac_temperature), 
+                   id(ac_max_mode) ? " (MAX MODE)" : "");
+          ESP_LOGD("sharp_ac", "Fan: %d (0=auto,1=low,2=mid,3=high)", id(ac_fan_speed));
+          ESP_LOGD("sharp_ac", "Ion: %s", id(ac_ion) ? "ON" : "OFF");
+          ESP_LOGD("sharp_ac", "Swing H/V: %s/%s", 
+                   id(ac_swing_horizontal) ? "ON" : "OFF",
+                   id(ac_swing_vertical) ? "ON" : "OFF");
+          ESP_LOGD("sharp_ac", "Progressive: %s", id(ac_progressive_airflow) ? "ON" : "OFF");
+          
+          char hex_str[120];
+          sprintf(hex_str, "0x%02X 0x%02X 0x%02X 0x%02X 0x%02X 0x%02X 0x%02X 0x%02X 0x%02X 0x%02X 0x%02X 0x%02X 0x%02X",
+                  data[0], data[1], data[2], data[3], data[4], data[5], data[6],
+                  data[7], data[8], data[9], data[10], data[11], data[12]);
+          ESP_LOGD("sharp_ac", "Bytes: %s", hex_str);
+          
+          id(ir_transmitted_bytes).publish_state(hex_str);
+          
+          // Build IR signal with NEGATIVE values for spaces
+          std::vector<int32_t> raw_data;
+          raw_data.push_back(3800);
+          raw_data.push_back(-1900);
+          
+          for (int byte_idx = 0; byte_idx < 13; byte_idx++) {
+            for (int bit = 0; bit < 8; bit++) {
+              raw_data.push_back(470);
+              if (data[byte_idx] & (1 << bit)) {
+                raw_data.push_back(-1420);
+              } else {
+                raw_data.push_back(-470);
+              }
+            }
+          }
+          raw_data.push_back(470);
+          
+          ESP_LOGD("sharp_ac", "Transmitting %d IR timings...", raw_data.size());
+          
+          // Use the transmitter directly with carrier frequency
+          auto transmit = id(ir_transmitter).transmit();
+          auto *data_ptr = transmit.get_data();
+          data_ptr->set_carrier_frequency(38000);
+          data_ptr->set_data(raw_data);
+          transmit.perform();
+          
+          ESP_LOGD("sharp_ac", "IR transmission complete");
+      # Update all UI elements after command is sent
+      - lambda: |-
+          id(ac_power_switch).publish_state(id(ac_power));
+          id(ac_temp_number).publish_state(id(ac_temperature));
+          id(ac_ion_switch).publish_state(id(ac_ion));
+          id(ac_swing_h_switch).publish_state(id(ac_swing_horizontal));
+          id(ac_swing_v_switch).publish_state(id(ac_swing_vertical));
+          id(ac_progressive_switch).publish_state(id(ac_progressive_airflow));
+          id(ac_max_mode_switch).publish_state(id(ac_max_mode));
+          
+          // Update mode select
+          const char* mode_text = "Heat";
+          if (id(ac_mode) == 0) mode_text = "Auto";
+          else if (id(ac_mode) == 1) mode_text = "Heat";
+          else if (id(ac_mode) == 2) mode_text = "Cool";
+          else if (id(ac_mode) == 3) mode_text = "Dry";
+          id(ac_mode_select).publish_state(mode_text);
+          
+          // Update fan select
+          const char* fan_text = "Auto";
+          if (id(ac_fan_speed) == 0) fan_text = "Auto";
+          else if (id(ac_fan_speed) == 1) fan_text = "Low";
+          else if (id(ac_fan_speed) == 2) fan_text = "Medium";
+          else if (id(ac_fan_speed) == 3) fan_text = "High";
+          id(ac_fan_select).publish_state(fan_text);
+
+debug:
+  update_interval: 30s
+
+# User interface controls
+text_sensor:
+  - platform: template
+    name: "AC Transmitted Bytes"
+    id: ir_transmitted_bytes
+    icon: "mdi:code-array"
+  
+  - platform: template
+    name: "AC Received Bytes"
+    id: ir_received_bytes
+    icon: "mdi:code-array"
+
+  - platform: debug
+    device:
+      name: "Device Info"
+    reset_reason:
+      name: "Reset Reason"
+
+sensor:
+  - platform: debug
+    free:
+      name: "Heap Free"
+    block:
+      name: "Heap Max Block"
+    loop_time:
+      name: "Loop Time"
+
+  - platform: template
+    name: "IR Signals Received"
+    id: ir_signal_count
+    accuracy_decimals: 0
+    icon: "mdi:counter"
+
+  - platform: homeassistant
+    name: "Temperature Sensor Vardagsrum"
+    entity_id: sensor.temp_vardagsrum_temperature
+    id: temp_vardagsrum_temperature_bosch
+    internal: false
+    disabled_by_default: true
+    device_class: temperature
+    state_class: measurement
+    unit_of_measurement: "°C"
+    
+select:
+  - platform: template
+    name: "AC Mode"
+    id: ac_mode_select
+    options:
+      - "Auto"
+      - "Heat"
+      - "Cool"
+      - "Dry"
+    initial_option: "Heat"
+    optimistic: false
+    set_action:
+      - lambda: |-
+          // Block if clean mode is active
+          if (id(ac_clean_mode)) {
+            ESP_LOGW("sharp_ac", "Cannot change mode - Clean mode is active");
+            // Restore current value
+            const char* mode_text = "Heat";
+            if (id(ac_mode) == 0) mode_text = "Auto";
+            else if (id(ac_mode) == 1) mode_text = "Heat";
+            else if (id(ac_mode) == 2) mode_text = "Cool";
+            else if (id(ac_mode) == 3) mode_text = "Dry";
+            id(ac_mode_select).publish_state(mode_text);
+            return;
+          }
+          
+          // Turn on power if it's off
+          bool was_off = !id(ac_power);
+          if (was_off) {
+            id(ac_power) = true;
+            id(ac_power_switch).publish_state(true);
+            id(ac_swing_horizontal) = false;
+            id(ac_swing_vertical) = false;
+            id(prev_swing_h) = false;
+            id(prev_swing_v) = false;
+            // Set fan to Auto when turning on
+            id(ac_fan_speed) = 0;
+            id(ac_fan_select).publish_state("Auto");
+            ESP_LOGD("sharp_ac", "Mode change - Power was OFF, turning ON with Auto fan");
+          }
+          
+          if (x == "Auto") {
+            id(ac_mode) = 0;
+            id(ac_temperature) = 0;
+            id(ac_temp_number).publish_state(id(ac_temperature));
+          } else if (x == "Heat") {
+            id(ac_mode) = 1;
+            id(ac_temperature) = 23;
+            id(ac_temp_number).publish_state(id(ac_temperature));
+          } else if (x == "Cool") {
+            id(ac_mode) = 2;
+            id(ac_temperature) = 26;
+            id(ac_temp_number).publish_state(id(ac_temperature));
+          } else if (x == "Dry") {
+            id(ac_mode) = 3;
+            id(ac_temperature) = 0;
+            id(ac_temp_number).publish_state(id(ac_temperature));
+            // Force fan to Auto in Dry mode
+            if (id(ac_fan_speed) != 0) {
+              id(ac_fan_speed) = 0;
+              id(ac_fan_select).publish_state("Auto");
+              ESP_LOGD("sharp_ac", "Dry mode selected - Fan speed forced to Auto");
+            }
+          }
+          id(ac_max_mode) = false;
+      - script.execute: send_ac_command
+      - if:
+          condition:
+            lambda: 'return !id(ac_swing_horizontal) && !id(ac_swing_vertical);'
+          then:
+            - delay: 800ms
+            - lambda: |-
+                ESP_LOGD("sharp_ac", "Toggling horizontal swing ON");
+                id(ac_swing_horizontal) = true;
+                id(ac_swing_h_switch).publish_state(true);
+            - script.execute: send_ac_command
+            - delay: 800ms
+            - lambda: |-
+                ESP_LOGD("sharp_ac", "Toggling vertical swing ON");
+                id(ac_swing_vertical) = true;
+                id(ac_swing_v_switch).publish_state(true);
+                id(ac_swing_control_select).publish_state("H + V");
+            - script.execute: send_ac_command
+  
+  - platform: template
+    name: "AC Fan Speed"
+    id: ac_fan_select
+    options:
+      - "Auto"
+      - "Low"
+      - "Medium"
+      - "High"
+    initial_option: "Auto"
+    optimistic: false
+    set_action:
+      - lambda: |-
+          // Block if clean mode is active
+          if (id(ac_clean_mode)) {
+            ESP_LOGW("sharp_ac", "Cannot change fan speed - Clean mode is active");
+            // Restore current value
+            const char* fan_text = "Auto";
+            if (id(ac_fan_speed) == 0) fan_text = "Auto";
+            else if (id(ac_fan_speed) == 1) fan_text = "Low";
+            else if (id(ac_fan_speed) == 2) fan_text = "Medium";
+            else if (id(ac_fan_speed) == 3) fan_text = "High";
+            id(ac_fan_select).publish_state(fan_text);
+            return;
+          }
+          
+          // Prevent non-Auto fan speed in Dry mode
+          if (id(ac_mode) == 3 && x != "Auto") {
+            ESP_LOGW("sharp_ac", "Fan speed change blocked - Dry mode only supports Auto fan");
+            id(ac_fan_select).publish_state("Auto");
+            return;
+          }
+          
+          if (x == "Auto") id(ac_fan_speed) = 0;
+          else if (x == "Low") id(ac_fan_speed) = 1;
+          else if (x == "Medium") id(ac_fan_speed) = 2;
+          else if (x == "High") id(ac_fan_speed) = 3;
+      - script.execute: send_ac_command
+  
+  - platform: template
+    name: "AC Swing Control"
+    id: ac_swing_control_select
+    icon: "mdi:arrow-oscillating"
+    options:
+      - "Off"
+      - "Horizontal"
+      - "Vertical"
+      - "Progressive"
+      - "H + V"
+      - "H + Progressive"
+    initial_option: "Off"
+    optimistic: false
+    set_action:
+      - lambda: |-
+          // Block if clean mode is active
+          if (id(ac_clean_mode)) {
+            ESP_LOGW("sharp_ac", "Cannot change swing control - Clean mode is active");
+            // Restore current value
+            if (!id(ac_swing_horizontal) && !id(ac_swing_vertical) && !id(ac_progressive_airflow)) {
+              id(ac_swing_control_select).publish_state("Off");
+            } else if (id(ac_swing_horizontal) && !id(ac_swing_vertical) && !id(ac_progressive_airflow)) {
+              id(ac_swing_control_select).publish_state("Horizontal");
+            } else if (!id(ac_swing_horizontal) && id(ac_swing_vertical) && !id(ac_progressive_airflow)) {
+              id(ac_swing_control_select).publish_state("Vertical");
+            } else if (!id(ac_swing_horizontal) && !id(ac_swing_vertical) && id(ac_progressive_airflow)) {
+              id(ac_swing_control_select).publish_state("Progressive");
+            } else if (id(ac_swing_horizontal) && id(ac_swing_vertical) && !id(ac_progressive_airflow)) {
+              id(ac_swing_control_select).publish_state("H + V");
+            } else if (id(ac_swing_horizontal) && !id(ac_swing_vertical) && id(ac_progressive_airflow)) {
+              id(ac_swing_control_select).publish_state("H + Progressive");
+            }
+            return;
+          }
+          
+          // Get current swing states
+          bool current_h = id(ac_swing_horizontal);
+          bool current_v = id(ac_swing_vertical);
+          bool current_p = id(ac_progressive_airflow);
+          
+          // Determine target states based on selection
+          bool target_h = false;
+          bool target_v = false;
+          bool target_p = false;
+          
+          if (x == "Off") {
+            target_h = false;
+            target_v = false;
+            target_p = false;
+          } else if (x == "Horizontal") {
+            target_h = true;
+            target_v = false;
+            target_p = false;
+          } else if (x == "Vertical") {
+            target_h = false;
+            target_v = true;
+            target_p = false;
+          } else if (x == "Progressive") {
+            target_h = false;
+            target_v = false;
+            target_p = true;
+          } else if (x == "H + V") {
+            target_h = true;
+            target_v = true;
+            target_p = false;
+          } else if (x == "H + Progressive") {
+            target_h = true;
+            target_v = false;
+            target_p = true;
+          }
+          
+          ESP_LOGD("sharp_ac", "Swing Control: %s -> Current H:%d V:%d P:%d, Target H:%d V:%d P:%d",
+                  x.c_str(), current_h, current_v, current_p, target_h, target_v, target_p);
+          
+          // Strategy: Send commands in sequence with delays
+          // Priority order: Progressive first, then Vertical, then Horizontal
+          
+          // Handle Progressive airflow change first (it conflicts with vertical)
+          if (current_p != target_p) {
+            id(ac_progressive_airflow) = target_p;
+            id(ac_progressive_switch).publish_state(target_p);
+            if (target_p) {
+              // Progressive turns off vertical
+              id(ac_swing_vertical) = false;
+              id(ac_swing_v_switch).publish_state(false);
+            }
+            ESP_LOGD("sharp_ac", "Changing Progressive airflow to: %s", target_p ? "ON" : "OFF");
+            id(send_ac_command).execute();
+            
+            // Wait before next command if needed
+            if ((current_v != target_v && !target_p) || current_h != target_h) {
+              delay(800);
+            }
+          }
+          
+          // Handle Vertical swing change (only if progressive is not active)
+          if (current_v != target_v && !target_p) {
+            id(ac_swing_vertical) = target_v;
+            id(ac_swing_v_switch).publish_state(target_v);
+            ESP_LOGD("sharp_ac", "Changing Vertical swing to: %s", target_v ? "ON" : "OFF");
+            id(send_ac_command).execute();
+            
+            // If we also need to change horizontal, wait before next command
+            if (current_h != target_h) {
+              delay(800);
+            }
+          }
+          
+          // Handle Horizontal swing change
+          if (current_h != target_h) {
+            id(ac_swing_horizontal) = target_h;
+            id(ac_swing_h_switch).publish_state(target_h);
+            ESP_LOGD("sharp_ac", "Changing Horizontal swing to: %s", target_h ? "ON" : "OFF");
+            id(send_ac_command).execute();
+          }
+          
+          // If no changes were needed, still send one command to sync
+          if (current_v == target_v && current_h == target_h && current_p == target_p) {
+            ESP_LOGD("sharp_ac", "Swing already in desired state - sending sync command");
+            id(send_ac_command).execute();
+          }
+          
+          // Final state update
+          id(ac_swing_control_select).publish_state(x.c_str());
+                    
+number:
+  - platform: template
+    name: "AC Temperature"
+    id: ac_temp_number
+    min_value: 18
+    max_value: 32
+    step: 1
+    initial_value: 20
+    optimistic: false
+    set_action:
+      - lambda: |-
+          // Block if clean mode is active
+          if (id(ac_clean_mode)) {
+            ESP_LOGW("sharp_ac", "Cannot change temperature - Clean mode is active");
+            id(ac_temp_number).publish_state(id(ac_temperature));
+            return;
+          }
+          
+          id(ac_temperature) = (int)x;
+          id(ac_max_mode) = false;
+      - script.execute: send_ac_command
+
+switch:
+  - platform: template
+    name: "AC Power"
+    id: ac_power_switch
+    optimistic: false
+    lambda: |-
+      return id(ac_power);
+    turn_on_action:
+      - lambda: |-        
+          id(ac_clean_mode) = false;
+          id(ac_power) = true;
+          id(ac_power_switch).publish_state(true);
+          id(ac_swing_horizontal) = false;
+          id(ac_swing_vertical) = false;
+          id(prev_swing_h) = false;
+          id(prev_swing_v) = false;
+          // Set fan speed to Auto when turning on
+          id(ac_fan_speed) = 0;
+          id(ac_fan_select).publish_state("Auto");
+          ESP_LOGD("sharp_ac", "Power switch ON - Fan set to Auto, Power: %d", id(ac_power));
+      - delay: 100ms
+      - script.execute: send_ac_command
+      - delay: 5000ms
+      - lambda: |-
+          ESP_LOGD("sharp_ac", "Toggling vertical swing ON");
+          id(ac_swing_vertical) = true;
+      - script.execute: send_ac_command
+      - delay: 6000ms
+      - lambda: |-
+          ESP_LOGD("sharp_ac", "Toggling horizontal swing ON");
+          id(ac_swing_horizontal) = true;
+          id(ac_swing_control_select).publish_state("H + V");
+      - script.execute: send_ac_command
+    turn_off_action:
+      - lambda: |-
+          // Block if clean mode is active
+          if (id(ac_clean_mode)) {
+            ESP_LOGW("sharp_ac", "Cannot turn off power - Clean mode is active");
+            id(ac_power_switch).publish_state(true);
+            return;
+          }
+          
+          id(ac_power) = false;
+          id(ac_max_mode) = false;
+          id(ac_swing_horizontal) = false;
+          id(ac_swing_vertical) = false;
+          id(prev_swing_h) = false;
+          id(prev_swing_v) = false;
+      - script.execute: send_ac_command
+  
+  - platform: template
+    name: "AC Ion"
+    id: ac_ion_switch
+    optimistic: false
+    lambda: |-
+      return id(ac_ion);
+    turn_on_action:
+      - lambda: |-
+          // Block if clean mode is active
+          if (id(ac_clean_mode)) {
+            ESP_LOGW("sharp_ac", "Cannot change ion - Clean mode is active");
+            id(ac_ion_switch).publish_state(id(ac_ion));
+            return;
+          }
+          
+          id(ac_ion) = true;
+      - script.execute: send_ac_command
+    turn_off_action:
+      - lambda: |-
+          // Block if clean mode is active
+          if (id(ac_clean_mode)) {
+            ESP_LOGW("sharp_ac", "Cannot change ion - Clean mode is active");
+            id(ac_ion_switch).publish_state(id(ac_ion));
+            return;
+          }
+          
+          id(ac_ion) = false;
+      - script.execute: send_ac_command
+  
+  - platform: template
+    name: "AC Swing Horizontal"
+    id: ac_swing_h_switch
+    optimistic: false
+    lambda: |-
+      return id(ac_swing_horizontal);
+    turn_on_action:
+      - lambda: |-
+          // Block if clean mode is active
+          if (id(ac_clean_mode)) {
+            ESP_LOGW("sharp_ac", "Cannot change swing - Clean mode is active");
+            id(ac_swing_h_switch).publish_state(id(ac_swing_horizontal));
+            return;
+          }
+          
+          id(ac_swing_horizontal) = true;
+      - script.execute: send_ac_command
+    turn_off_action:
+      - lambda: |-
+          // Block if clean mode is active
+          if (id(ac_clean_mode)) {
+            ESP_LOGW("sharp_ac", "Cannot change swing - Clean mode is active");
+            id(ac_swing_h_switch).publish_state(id(ac_swing_horizontal));
+            return;
+          }
+          
+          id(ac_swing_horizontal) = false;
+      - script.execute: send_ac_command
+  
+  - platform: template
+    name: "AC Swing Vertical"
+    id: ac_swing_v_switch
+    optimistic: false
+    lambda: |-
+      return id(ac_swing_vertical);
+    turn_on_action:
+      - lambda: |-
+          // Block if clean mode is active
+          if (id(ac_clean_mode)) {
+            ESP_LOGW("sharp_ac", "Cannot change swing - Clean mode is active");
+            id(ac_swing_v_switch).publish_state(id(ac_swing_vertical));
+            return;
+          }
+          
+          id(ac_swing_vertical) = true;
+          id(ac_progressive_airflow) = false;
+      - script.execute: send_ac_command
+    turn_off_action:
+      - lambda: |-
+          // Block if clean mode is active
+          if (id(ac_clean_mode)) {
+            ESP_LOGW("sharp_ac", "Cannot change swing - Clean mode is active");
+            id(ac_swing_v_switch).publish_state(id(ac_swing_vertical));
+            return;
+          }
+          
+          id(ac_swing_vertical) = false;
+      - script.execute: send_ac_command
+  
+  - platform: template
+    name: "AC Max Mode"
+    id: ac_max_mode_switch
+    icon: "mdi:arrow-up-bold-circle"
+    optimistic: false
+    lambda: |-
+      return id(ac_max_mode);
+    turn_on_action:
+      - lambda: |-
+          // Block if clean mode is active
+          if (id(ac_clean_mode)) {
+            ESP_LOGW("sharp_ac", "Cannot change max mode - Clean mode is active");
+            id(ac_max_mode_switch).publish_state(id(ac_max_mode));
+            return;
+          }
+          
+          id(ac_max_mode) = true;
+          if (id(ac_fan_speed) != 0) {
+            id(ac_fan_speed) = 0;
+          }
+      - script.execute: send_ac_command
+    turn_off_action:
+      - lambda: |-
+          // Block if clean mode is active
+          if (id(ac_clean_mode)) {
+            ESP_LOGW("sharp_ac", "Cannot change max mode - Clean mode is active");
+            id(ac_max_mode_switch).publish_state(id(ac_max_mode));
+            return;
+          }
+          
+          id(ac_max_mode) = false;
+      - script.execute: send_ac_command
+
+  - platform: template
+    name: "AC Progressive Airflow"
+    id: ac_progressive_switch
+    optimistic: false
+    lambda: |-
+      return id(ac_progressive_airflow);
+    turn_on_action:
+      - lambda: |-
+          // Block if clean mode is active
+          if (id(ac_clean_mode)) {
+            ESP_LOGW("sharp_ac", "Cannot change progressive airflow - Clean mode is active");
+            id(ac_progressive_switch).publish_state(id(ac_progressive_airflow));
+            return;
+          }
+
+          if (id(ac_swing_horizontal) && id(ac_swing_vertical)) id(ac_swing_control_select).publish_state("Horizontal");
+          if (id(ac_swing_vertical)) id(ac_swing_control_select).publish_state("Off");
+          id(ac_progressive_airflow) = true;
+          id(ac_swing_vertical) = false;
+      - script.execute: send_ac_command
+    turn_off_action:
+      - lambda: |-
+          // Block if clean mode is active
+          if (id(ac_clean_mode)) {
+            ESP_LOGW("sharp_ac", "Cannot change progressive airflow - Clean mode is active");
+            id(ac_progressive_switch).publish_state(id(ac_progressive_airflow));
+            return;
+          }
+          
+          id(ac_progressive_airflow) = false;
+      - script.execute: send_ac_command
+
+  - platform: template
+    name: "AC Clean Mode"
+    id: ac_clean_mode_switch
+    icon: "mdi:refresh"
+    optimistic: false
+    lambda: |-
+      return id(ac_clean_mode);
+    turn_on_action:
+      - lambda: |-
+          id(ac_power) = false;
+          id(ac_max_mode) = false;
+          id(ac_ion) = false;
+          id(ac_swing_horizontal) = false;
+          id(ac_swing_vertical) = false;
+          id(ac_progressive_airflow) = false;
+          id(prev_swing_h) = false;
+          id(prev_swing_v) = false;
+      - script.execute: send_ac_command
+      - delay: 800ms
+      - lambda: |-
+          id(last_transmit_time) = millis();
+          
+          uint8_t data[13] = {
+            0xAA, 0x5A, 0xCF, 0x10, 0x00, 0x11, 0x2B,
+            0x0C, 0x08, 0x80, 0x00, 0xF0, 0x61
+          };
+          
+          std::vector<int32_t> raw_data;
+          raw_data.push_back(3800);
+          raw_data.push_back(-1900);
+          
+          for (int byte_idx = 0; byte_idx < 13; byte_idx++) {
+            for (int bit = 0; bit < 8; bit++) {
+              raw_data.push_back(470);
+              if (data[byte_idx] & (1 << bit)) {
+                raw_data.push_back(-1420);
+              } else {
+                raw_data.push_back(-470);
+              }
+            }
+          }
+          raw_data.push_back(470);
+          
+          auto call = id(ir_transmitter).transmit();
+          call.get_data()->set_data(raw_data);
+          call.perform();
+
+          ESP_LOGD("sharp_ac", "Toggling CLEAN mode on");
+          id(ac_clean_mode) = true;
+    turn_off_action:
+      - lambda: |-
+          id(last_transmit_time) = millis();
+          
+          uint8_t data[13] = {
+            0xAA, 0x5A, 0xCF, 0x10, 0x06, 0x21, 0x21,
+            0x0C, 0x08, 0x80, 0x00, 0xF0, 0x91
+          };
+          
+          std::vector<int32_t> raw_data;
+          raw_data.push_back(3800);
+          raw_data.push_back(-1900);
+          
+          for (int byte_idx = 0; byte_idx < 13; byte_idx++) {
+            for (int bit = 0; bit < 8; bit++) {
+              raw_data.push_back(470);
+              if (data[byte_idx] & (1 << bit)) {
+                raw_data.push_back(-1420);
+              } else {
+                raw_data.push_back(-470);
+              }
+            }
+          }
+          raw_data.push_back(470);
+          
+          auto call = id(ir_transmitter).transmit();
+          call.get_data()->set_data(raw_data);
+          call.perform();
+
+          ESP_LOGD("sharp_ac", "Toggling CLEAN mode off");
+          id(ac_clean_mode) = false;
+
+button:
+  - platform: template
+    name: "AC Auto Mode"
+    icon: "mdi:autorenew"
+    on_press:
+      - lambda: |-
+          if (id(ac_clean_mode)) {
+            ESP_LOGW("sharp_ac", "Cannot activate auto mode - Clean mode active");
+            return;
+          }
+          if (!id(ac_power)) {
+            id(ac_power) = true;
+            id(ac_swing_horizontal) = false;
+            id(ac_swing_vertical) = false;
+            id(prev_swing_h) = false;
+            id(prev_swing_v) = false;
+          }
+          id(ac_mode) = 0;
+          id(ac_temperature) = 0;
+          id(ac_max_mode) = false;
+          // Set fan to Auto
+          id(ac_fan_speed) = 0;
+          id(ac_fan_select).publish_state("Auto");
+      - script.execute: send_ac_command
+
+  - platform: template
+    name: "AC Dry Mode"
+    icon: "mdi:water-percent"
+    on_press:
+      - lambda: |-
+          if (id(ac_clean_mode)) {
+            ESP_LOGW("sharp_ac", "Cannot activate dry mode - Clean mode active");
+            return;
+          }
+          if (!id(ac_power)) {
+            id(ac_power) = true;
+            id(ac_swing_horizontal) = false;
+            id(ac_swing_vertical) = false;
+            id(prev_swing_h) = false;
+            id(prev_swing_v) = false;
+          }
+          id(ac_mode) = 3;
+          id(ac_temperature) = 0;
+          id(ac_fan_speed) = 0;
+          id(ac_fan_select).publish_state("Auto");
+          id(ac_max_mode) = false;
+      - script.execute: send_ac_command
+      
+  - platform: restart
+    name: "Restart Bosch ESP32 board"
+
+  - platform: template
+    name: "Send AC Command"
+    on_press:
+      - lambda: |-
+          // Block if clean mode is active
+          if (id(ac_clean_mode)) {
+            ESP_LOGW("sharp_ac", "Cannot send command - Clean mode is active");
+            return;
+          }
+      - script.execute: send_ac_command
+      - lambda: |-
+          // Update swing control select to match current state
+          if (!id(ac_swing_horizontal) && !id(ac_swing_vertical) && !id(ac_progressive_airflow)) {
+            id(ac_swing_control_select).publish_state("Off");
+          } else if (id(ac_swing_horizontal) && !id(ac_swing_vertical) && !id(ac_progressive_airflow)) {
+            id(ac_swing_control_select).publish_state("Horizontal");
+          } else if (!id(ac_swing_horizontal) && id(ac_swing_vertical) && !id(ac_progressive_airflow)) {
+            id(ac_swing_control_select).publish_state("Vertical");
+          } else if (!id(ac_swing_horizontal) && !id(ac_swing_vertical) && id(ac_progressive_airflow)) {
+            id(ac_swing_control_select).publish_state("Progressive");
+          } else if (id(ac_swing_horizontal) && id(ac_swing_vertical) && !id(ac_progressive_airflow)) {
+            id(ac_swing_control_select).publish_state("H + V");
+          } else if (id(ac_swing_horizontal) && !id(ac_swing_vertical) && id(ac_progressive_airflow)) {
+            id(ac_swing_control_select).publish_state("H + Progressive");
+          }
+  
+  - platform: template
+    name: "AC Fan Mode"
+    icon: "mdi:fan"
+    on_press:
+      - lambda: |-
+          // Block if clean mode is active
+          if (id(ac_clean_mode)) {
+            ESP_LOGW("sharp_ac", "Cannot activate fan mode - Clean mode is active");
+            return;
+          }
+          
+          ESP_LOGD("sharp_ac", "Activating Fan Mode");
+          id(ac_power) = true;
+          id(ac_mode) = 1;
+          id(ac_fan_speed) = 0;
+          id(ac_fan_select).publish_state("Auto");
+          id(ac_swing_horizontal) = false;
+          id(ac_swing_vertical) = false;
+          id(prev_swing_h) = false;
+          id(prev_swing_v) = false;
+      - delay: 100ms
+      - lambda: |-
+          id(ac_temperature) = 18;
+      - delay: 100ms
+      - script.execute: send_ac_command
+      - delay: 800ms
+      - lambda: |-
+          ESP_LOGD("sharp_ac", "Toggling horizontal swing ON");
+          id(ac_swing_horizontal) = true;
+      - script.execute: send_ac_command
+      - delay: 800ms
+      - lambda: |-
+          ESP_LOGD("sharp_ac", "Toggling vertical swing ON");
+          id(ac_swing_vertical) = true;
+      - script.execute: send_ac_command
+
+  - platform: template
+    name: "10 degree Mode"
+    icon: "mdi:thermometer-low"
+    on_press:
+      - lambda: |-
+          // Block if clean mode is active
+          if (id(ac_clean_mode)) {
+            ESP_LOGW("sharp_ac", "Cannot activate 10 degree mode - Clean mode is active");
+            return;
+          }
+          
+          ESP_LOGD("sharp_ac", "Activating 10 Degree Mode");
+          id(ac_power) = true;
+          id(ac_mode) = 1;
+          id(ac_fan_speed) = 0;
+          id(ac_fan_select).publish_state("Auto");
+          id(ac_swing_horizontal) = false;
+          id(ac_swing_vertical) = false;
+          id(prev_swing_h) = false;
+          id(prev_swing_v) = false;
+      - delay: 100ms
+      - lambda: |-
+          id(ac_temperature) = 10;
+      - delay: 100ms
+      - script.execute: send_ac_command
+      - delay: 800ms
+      - lambda: |-
+          ESP_LOGD("sharp_ac", "Toggling horizontal swing ON");
+          id(ac_swing_horizontal) = true;
+      - script.execute: send_ac_command
+      - delay: 800ms
+      - lambda: |-
+          ESP_LOGD("sharp_ac", "Toggling vertical swing ON");
+          id(ac_swing_vertical) = true;
+      - script.execute: send_ac_command
+
+  - platform: template
+    name: "Reset Byte7 Counter"
+    on_press:
+      - lambda: |-
+          // Block if clean mode is active
+          if (id(ac_clean_mode)) {
+            ESP_LOGW("sharp_ac", "Cannot reset counter - Clean mode is active");
+            return;
+          }
+          
+          id(byte7_counter) = 0;
+          ESP_LOGD("sharp_ac", "Byte7 counter reset to 0x16");
+
+  - platform: template
+    name: "Temperature Up"
+    icon: "mdi:chevron-up"
+    on_press:
+      - lambda: |-
+          // Block if clean mode is active
+          if (id(ac_clean_mode)) {
+            ESP_LOGW("sharp_ac", "Cannot change temperature - Clean mode is active");
+            return;
+          }
+          
+          // For Auto mode (0) or Dry mode (3): adjust offset between -2 and +2
+          if (id(ac_mode) == 0 || id(ac_mode) == 3) {
+            if (id(ac_temperature) < 2) {
+              id(ac_temperature) += 1;
+              ESP_LOGD("sharp_ac", "Auto/Dry offset increased to: %d", id(ac_temperature));
+            } else {
+              ESP_LOGW("sharp_ac", "Already at maximum offset (+2)");
+            }
+          } else {
+            // For Heat/Cool modes: increase temperature (18-32°C)
+            if (id(ac_temperature) < 32) {
+              id(ac_temperature) += 1;
+              id(ac_temp_number).publish_state(id(ac_temperature));
+              ESP_LOGD("sharp_ac", "Temperature increased to: %d°C", id(ac_temperature));
+            } else {
+              ESP_LOGW("sharp_ac", "Already at maximum temperature (32°C)");
+            }
+          }
+      - script.execute: send_ac_command
+  
+  - platform: template
+    name: "Temperature Down"
+    icon: "mdi:chevron-down"
+    on_press:
+      - lambda: |-
+          // Block if clean mode is active
+          if (id(ac_clean_mode)) {
+            ESP_LOGW("sharp_ac", "Cannot change temperature - Clean mode is active");
+            return;
+          }
+          
+          // For Auto mode (0) or Dry mode (3): adjust offset between -2 and +2
+          if (id(ac_mode) == 0 || id(ac_mode) == 3) {
+            if (id(ac_temperature) > -2) {
+              id(ac_temperature) -= 1;
+              ESP_LOGD("sharp_ac", "Auto/Dry offset decreased to: %d", id(ac_temperature));
+            } else {
+              ESP_LOGW("sharp_ac", "Already at minimum offset (-2)");
+            }
+          } else {
+            // For Heat/Cool modes: decrease temperature (18-32°C)
+            if (id(ac_temperature) > 18) {
+              id(ac_temperature) -= 1;
+              id(ac_temp_number).publish_state(id(ac_temperature));
+              ESP_LOGD("sharp_ac", "Temperature decreased to: %d°C", id(ac_temperature));
+            } else {
+              ESP_LOGW("sharp_ac", "Already at minimum temperature (18°C)");
+            }
+          }
+      - script.execute: send_ac_command
